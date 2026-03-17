@@ -1,0 +1,752 @@
+\documentclass[11pt,a4paper]{article}
+
+% ── Packages ──────────────────────────────────────────────────────────
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts,bbm}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{caption}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{bm}
+\usepackage{float}
+
+% ── Custom commands ───────────────────────────────────────────────────
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\softmax}{\mathrm{softmax}}
+\newcommand{\sigmoid}{\sigma}
+\newcommand{\layernorm}{\mathrm{LayerNorm}}
+\newcommand{\gelu}{\mathrm{GELU}}
+\newcommand{\relu}{\mathrm{ReLU}}
+\newcommand{\concat}{\mathrm{concat}}
+\newcommand{\cls}{\mathrm{CLS}}
+
+\begin{document}
+
+% ══════════════════════════════════════════════════════════════════════
+\section{Methodology}
+\label{sec:methodology}
+% ══════════════════════════════════════════════════════════════════════
+
+This section presents the complete methodology of the proposed women safety surveillance system. The system processes live video through a five-stage pipeline: (1)~person detection and tracking, (2)~visibility-conditioned dual-model gender classification, (3)~dual-stream SlowFast violence detection with optical flow, (4)~Gradient-weighted Class Activation Mapping (Grad-CAM) for spatial evidence localization, and (5)~rule-based alert generation with operator verification and evidence capture. Each stage is formulated with full mathematical detail and algorithmic specification below.
+
+
+% ──────────────────────────────────────────────────────────────────────
+\subsection{System Architecture Overview}
+\label{subsec:overview}
+% ──────────────────────────────────────────────────────────────────────
+
+Given an input video stream $\mathcal{V} = \{I_1, I_2, \ldots, I_T\}$ where each frame $I_t \in \R^{H \times W \times 3}$ (BGR), the system maintains a set of tracked persons $\mathcal{P}_t = \{p_1, p_2, \ldots, p_{N_t}\}$ and produces per-frame alert decisions. The end-to-end frame processing pipeline is:
+
+\begin{equation}
+I_t \xrightarrow{\text{YOLO}} \mathcal{D}_t \xrightarrow{\text{IoU Track}} \mathcal{P}_t \xrightarrow[\text{Violence}]{\text{Gender}} (g_i, v_t) \xrightarrow{\text{Grad-CAM}} \mathcal{B}_t \xrightarrow{\text{Alert}} (\ell_t, \mathcal{E}_t)
+\label{eq:pipeline}
+\end{equation}
+
+\noindent where $g_i \in [0,1]$ is the gender probability for person $p_i$, $v_t$ is the scene-level violence prediction, $\mathcal{B}_t$ is the set of Grad-CAM evidence bounding boxes, $\ell_t$ is the alert flag, and $\mathcal{E}_t$ is the captured evidence package.
+
+\begin{algorithm}[H]
+\caption{Women Safety System: Frame Processing Pipeline}\label{alg:pipeline}
+\begin{algorithmic}[1]
+\Require Frame $I_t \in \R^{H \times W \times 3}$, tracked state from frame $t{-}1$
+\Ensure Alert flags, annotated frame $\hat{I}_t$
+
+\State $\mathcal{D}_t \gets \textsc{YOLOv5s}(I_t,\; \tau_{\text{det}}=0.4,\; \text{class}=\textit{person})$ \hfill $\triangleright$ Stage 1: Detection
+
+\For{each detection $d_j \in \mathcal{D}_t$}
+    \State $\mathbf{K}_j \gets \textsc{MediaPipePose}(\textsc{Crop}(I_t, d_j))$ \hfill $\triangleright$ Pose estimation
+    \State $\text{vis}_j \gets \textsc{CheckFullBodyVisible}(\mathbf{K}_j)$
+\EndFor
+
+\State $\mathcal{P}_t \gets \textsc{IoUTracking}(\mathcal{D}_t, \mathcal{P}_{t-1},\; \tau_{\text{IoU}}=0.5)$ \hfill $\triangleright$ Tracking
+
+\For{each person $p_i \in \mathcal{P}_t$} \hfill $\triangleright$ Stage 2: Gender Classification
+    \State $\mathbf{x}_i^{\text{face}} \gets \textsc{UpperBodyCrop}_{40\%}(\textsc{Crop}(I_t, p_i))$
+    \State $\mathbf{x}_i^{\text{body}} \gets \textsc{Crop}(I_t, p_i)$
+    \State $\hat{g}_i^{\text{face}} \gets P_{\text{male}}^{\text{face}}(\mathbf{x}_i^{\text{face}})$; \quad $\hat{g}_i^{\text{body}} \gets P_{\text{male}}^{\text{body}}(\mathbf{x}_i^{\text{body}})$
+    \State $g_i^{(t)} \gets \textsc{VisibilityFusion}(\hat{g}_i^{\text{face}}, \hat{g}_i^{\text{body}}, \text{vis}_i)$ \hfill $\triangleright$ Eq.~\eqref{eq:vis_fusion}
+\EndFor
+
+\State Add $I_t$ to frame buffer $\mathcal{F}$ \hfill $\triangleright$ Stage 3: Violence Detection
+\State $(c_v, p_v) \gets \textsc{DualSlowFast}(\mathcal{F})$ \hfill $\triangleright$ RGB + optical flow streams
+
+\If{$c_v = \textit{Fight}$ and $p_v > 0.6$} \hfill $\triangleright$ Stage 4: Grad-CAM Evidence
+    \State $\mathcal{H}_t \gets \textsc{GradCAM}(\text{RGB stream, blocks[5]})$
+    \State $\mathcal{B}_t \gets \textsc{ExtractBBoxes}(\mathcal{H}_t,\; \tau=0.5,\; A_{\min}=1600)$
+\EndIf
+
+\State $\ell_{\text{lone}} \gets \textsc{LoneWomanAlert}(\mathcal{P}_t)$ \hfill $\triangleright$ Stage 5: Alert System
+\State $\ell_{\text{viol}} \gets \textsc{ViolenceAlert}(\mathcal{P}_t, \mathcal{B}_t)$
+
+\If{$p_v \geq \tau_{\text{evidence}}$ and cooldown elapsed} \hfill $\triangleright$ Evidence Capture
+    \State $\mathcal{E}_t \gets \textsc{CaptureEvidence}(I_t, \mathcal{H}_t, \mathcal{B}_t, \mathcal{P}_t)$
+\EndIf
+
+\State $\hat{I}_t \gets \textsc{DrawOverlay}(I_t, \mathcal{P}_t, \mathcal{H}_t, \mathcal{B}_t, \ell_{\text{lone}}, \ell_{\text{viol}})$
+\State \Return $\hat{I}_t,\; \ell_{\text{lone}},\; \ell_{\text{viol}}$
+\end{algorithmic}
+\end{algorithm}
+
+
+% ──────────────────────────────────────────────────────────────────────
+\subsection{Person Detection and Tracking}
+\label{subsec:detection}
+% ──────────────────────────────────────────────────────────────────────
+
+\subsubsection{Detection.}
+Person detection is performed using YOLOv5s~\cite{yolov5}, a single-shot anchor-based object detector. Given frame $I_t$, the detector produces a set of bounding-box proposals:
+\begin{equation}
+\mathcal{D}_t = \bigl\{(\mathbf{b}_j, c_j) \;\big|\; c_j > \tau_{\text{det}},\; \text{class}_j = \textit{person}\bigr\}
+\end{equation}
+where $\mathbf{b}_j = (x_1, y_1, x_2, y_2)$ are box coordinates, $c_j \in [0,1]$ is the detection confidence, and $\tau_{\text{det}} = 0.40$. To bound compute cost, only the top $N_{\max} = 10$ detections (ranked by confidence) are retained per frame.
+
+\subsubsection{IoU-Based Tracking.}
+Persistent identity assignment across frames uses greedy Intersection-over-Union (IoU) matching. For a new detection $\mathbf{b}_j^{(t)}$ at frame $t$, the IoU with each existing track $p_i$ is:
+\begin{equation}
+\text{IoU}(\mathbf{b}_j^{(t)}, \mathbf{b}_i^{(t-1)}) = \frac{|\mathbf{b}_j^{(t)} \cap \mathbf{b}_i^{(t-1)}|}{|\mathbf{b}_j^{(t)} \cup \mathbf{b}_i^{(t-1)}|}
+\label{eq:iou}
+\end{equation}
+
+A detection is associated with the track having the highest IoU, provided $\text{IoU} > \tau_{\text{IoU}} = 0.5$. Unmatched detections initialize new tracks. Tracks unmatched for more than $T_{\text{age}} = 5$ consecutive frames are terminated. Each tracked person $p_i$ accumulates a gender probability history buffer $\mathcal{G}_i$ of length $K = 5$, enabling temporal smoothing of gender predictions.
+
+\subsubsection{Visibility Assessment.}
+For each detection, MediaPipe Pose~\cite{mediapipe} (complexity $= 0$, fastest mode) extracts 33 body keypoints. Full-body visibility is determined by checking whether at least 4 of the 6 lower-body landmarks (left/right hip, knee, ankle) have visibility $> 0.5$:
+\begin{equation}
+\text{vis}_i = \begin{cases}
+\textit{full} & \text{if } \displaystyle\sum_{j \in \mathcal{L}} \mathbbm{1}\bigl[v_j > 0.5\bigr] \geq 4 \\[4pt]
+\textit{upper} & \text{otherwise}
+\end{cases}
+\label{eq:visibility}
+\end{equation}
+where $\mathcal{L} = \{\text{L-Hip, R-Hip, L-Knee, R-Knee, L-Ankle, R-Ankle}\}$ and $v_j$ is the keypoint visibility confidence from MediaPipe. This visibility flag drives the gender fusion strategy (Section~\ref{subsec:gender_fusion}).
+
+
+% ──────────────────────────────────────────────────────────────────────
+\subsection{Gender Classification with EVA-02 Large ViT}
+\label{subsec:gender}
+% ──────────────────────────────────────────────────────────────────────
+
+Gender classification is performed by two independent EVA-02 Large Vision Transformer (ViT) models~\cite{eva02}: one trained on full body crops (\textbf{body model}) and one trained on upper-body crops (\textbf{face model}). Both share the same backbone architecture but are trained separately.
+
+\subsubsection{Architecture.}
+EVA-02 Large~\cite{eva02} is a ViT-L/14 backbone with 304M parameters, pretrained with Masked Image Modeling (MIM) on Merged-38M and fine-tuned on ImageNet-22K$\to$1K. It processes $448 \times 448$ images through the following stages:
+
+\begin{enumerate}[nosep]
+    \item \textbf{Patch Embedding}: The input image $\mathbf{x} \in \R^{3 \times 448 \times 448}$ is partitioned into $14 \times 14$ pixel patches, yielding $N_{\text{patches}} = (448/14)^2 = 1024$ patch tokens. A learnable CLS token is prepended, and absolute positional embeddings are added:
+    \begin{equation}
+    \mathbf{Z}_0 = \bigl[\mathbf{z}_{\cls};\; \mathbf{E}\,\mathbf{x}_1;\; \ldots;\; \mathbf{E}\,\mathbf{x}_{1024}\bigr] + \mathbf{E}_{\text{pos}} \in \R^{1025 \times 1024}
+    \end{equation}
+    where $\mathbf{E} \in \R^{1024 \times (14 \times 14 \times 3)}$ is the patch projection matrix.
+    
+    \item \textbf{Transformer Blocks}: The token sequence is processed by $L = 24$ Transformer blocks with Rotary Position Embedding (RoPE) and Stochastic Depth (drop path rate $= 0.4$). Each block applies multi-head self-attention (MHSA) and feed-forward network (FFN):
+    \begin{align}
+    \mathbf{Z}'_l &= \mathbf{Z}_{l-1} + \text{MHSA}\bigl(\layernorm(\mathbf{Z}_{l-1})\bigr) \\
+    \mathbf{Z}_l &= \mathbf{Z}'_l + \text{FFN}\bigl(\layernorm(\mathbf{Z}'_l)\bigr)
+    \end{align}
+    for $l = 1, 2, \ldots, 24$, with hidden dimension $d = 1024$ and $H = 16$ attention heads.
+    
+    \item \textbf{CLS Token Extraction}: The final CLS token $\mathbf{z}_{\cls}^{(24)} \in \R^{1024}$ serves as the global image representation.
+    
+    \item \textbf{Classification Head}: A custom lightweight head replaces the default ImageNet classifier:
+    \begin{equation}
+    \hat{\mathbf{y}} = \mathbf{W}_c \cdot \text{Dropout}_{p}\bigl(\layernorm(\mathbf{z}_{\cls}^{(24)})\bigr) + \mathbf{b}_c \in \R^2
+    \label{eq:gender_head}
+    \end{equation}
+    where $\mathbf{W}_c \in \R^{2 \times 1024}$ and dropout rate $p = 0.5$.
+\end{enumerate}
+
+Gender probability is obtained as:
+\begin{equation}
+P(\text{male}) = \softmax(\hat{\mathbf{y}})_1
+\end{equation}
+where class 0 = Female and class 1 = Male.
+
+
+\begin{algorithm}[H]
+\caption{EVA-02 Large ViT: Gender Classification Forward Pass}\label{alg:gender_forward}
+\begin{algorithmic}[1]
+\Require Person crop $\mathbf{x} \in \R^{H \times W \times 3}$, model variant $\in \{\text{face}, \text{body}\}$
+\Ensure Gender probability $P(\text{male}) \in [0, 1]$
+
+\If{variant $= \text{face}$}
+    \State $\mathbf{x} \gets \textsc{UpperBodyCrop}_{40\%}(\mathbf{x})$ \hfill $\triangleright$ Top 40\% of bounding box
+\EndIf
+
+\State $\mathbf{x} \gets \textsc{Resize}(\mathbf{x}, 448 \times 448)$
+\State $\mathbf{x} \gets (\mathbf{x}/255 - \boldsymbol{\mu}) / \boldsymbol{\sigma}$ \hfill $\triangleright$ ImageNet normalization
+
+\State $\mathbf{Z}_0 \gets [\mathbf{z}_{\cls};\; \mathbf{E}\mathbf{x}_1;\; \ldots;\; \mathbf{E}\mathbf{x}_{1024}] + \mathbf{E}_{\text{pos}}$ \hfill $\triangleright$ Patch embedding
+
+\For{$l = 1$ to $24$} \hfill $\triangleright$ 24 Transformer blocks
+    \State $\mathbf{Z}'_l \gets \mathbf{Z}_{l-1} + \text{MHSA}(\layernorm(\mathbf{Z}_{l-1}))$ \hfill $\triangleright$ + RoPE, DropPath
+    \State $\mathbf{Z}_l \gets \mathbf{Z}'_l + \text{FFN}(\layernorm(\mathbf{Z}'_l))$
+\EndFor
+
+\State $\mathbf{z}_{\cls} \gets \mathbf{Z}_{24}[0] \in \R^{1024}$ \hfill $\triangleright$ CLS token
+
+\State $\hat{\mathbf{y}} \gets \mathbf{W}_c \cdot \text{Dropout}_{0.5}(\layernorm(\mathbf{z}_{\cls})) + \mathbf{b}_c \in \R^2$ \hfill $\triangleright$ Custom head
+\State $P(\text{male}) \gets \softmax(\hat{\mathbf{y}})_1$
+
+\State \Return $P(\text{male})$
+\end{algorithmic}
+\end{algorithm}
+
+
+\subsubsection{Face Model: Upper-Body Crop.}
+The face model operates on the \textbf{top 40\%} of the detected bounding box, capturing face, hair, and shoulder regions:
+\begin{equation}
+\textsc{UpperBodyCrop}(\mathbf{x}, r) = \mathbf{x}\bigl[0:0,\; 0:\lfloor r \cdot H \rfloor,\; 0:W\bigr], \quad r = 0.40
+\label{eq:upper_crop}
+\end{equation}
+This crop focuses on facial features and upper-body clothing, which are less susceptible to occlusion from lower-body obstructions.
+
+
+\subsubsection{Visibility-Conditioned Gender Fusion.}
+\label{subsec:gender_fusion}
+The face and body model predictions are fused using the visibility flag from the pose estimator:
+\begin{equation}
+g_i = \begin{cases}
+0.6 \cdot P_{\text{male}}^{\text{body}}(\mathbf{x}_i) + 0.4 \cdot P_{\text{male}}^{\text{face}}(\mathbf{x}_i) & \text{if vis}_i = \textit{full} \\[6pt]
+P_{\text{male}}^{\text{face}}(\mathbf{x}_i) & \text{if vis}_i = \textit{upper}
+\end{cases}
+\label{eq:vis_fusion}
+\end{equation}
+
+When the full body is visible, the body model receives higher weight ($0.6$) as it leverages richer visual evidence (clothing, body shape, posture), while the face model contributes complementary upper-body cues ($0.4$). When only the upper body is detected (partial occlusion), the system falls back entirely to the face model to avoid unreliable body predictions from truncated crops.
+
+\subsubsection{Temporal Smoothing.}
+Raw predictions are stabilized across frames using a sliding-window average over the gender history buffer $\mathcal{G}_i$ of length $K = 5$:
+\begin{equation}
+\bar{g}_i^{(t)} = \frac{1}{|\mathcal{G}_i|} \sum_{g \in \mathcal{G}_i} g
+\label{eq:gender_smooth}
+\end{equation}
+Gender is assigned as: $\text{Female if } \bar{g}_i < 0.5$, $\text{Male otherwise}$.
+
+
+% ──────────────────────────────────────────────────────────────────────
+\subsection{Training Procedure for Gender Classifiers}
+\label{subsec:gender_training}
+% ──────────────────────────────────────────────────────────────────────
+
+Both gender models (face and body) are trained on the PA-100K pedestrian attribute recognition dataset~\cite{pa100k}, comprising 100,000 pedestrian images split into 80K/10K/10K for training, validation, and testing. Binary gender labels are used (Female $= 0$, Male $= 1$). A two-phase training strategy is employed.
+
+\subsubsection{Phase~1: Head-Only Training ($E_1 = 15$ epochs).}
+The entire EVA-02 backbone is frozen; only the custom classification head (Eq.~\eqref{eq:gender_head}) is trained. This prevents catastrophic forgetting of pretrained representations during initial head adaptation.
+
+\textbf{Optimizer}: AdamW~\cite{adamw} with learning rate $\eta = 10^{-3}$, weight decay $\lambda = 0.05$, and default momentum parameters ($\beta_1 = 0.9$, $\beta_2 = 0.999$):
+\begin{equation}
+\boldsymbol{\theta}_{t+1} = \boldsymbol{\theta}_t - \eta \left(\frac{\hat{\mathbf{m}}_t}{\sqrt{\hat{\mathbf{v}}_t} + \epsilon} + \lambda\,\boldsymbol{\theta}_t\right)
+\label{eq:adamw}
+\end{equation}
+
+\textbf{Learning Rate Schedule}: OneCycleLR~\cite{onecycle} with maximum learning rate $\eta_{\max} = 3 \times 10^{-3}$, warmup fraction $= 0.1$, and cosine annealing:
+\begin{equation}
+\eta^{(t)} = \eta_{\min} + \frac{1}{2}(\eta_{\max} - \eta_{\min})\left(1 + \cos\!\left(\frac{t - t_w}{T - t_w}\pi\right)\right), \quad t \geq t_w
+\end{equation}
+where $t_w = 0.1 \cdot T$ is the warmup length.
+
+\subsubsection{Phase~2: Full Fine-Tuning ($E_2 = 12$ epochs).}
+All backbone parameters are unfrozen and trained with layer-wise learning rate decay to preserve low-level pretrained features while adapting high-level representations.
+
+\textbf{Layer-Wise Learning Rate Decay}: With decay ratio $r = 0.85$ and base learning rate $\eta_{\text{base}} = 5 \times 10^{-6}$, the 24 transformer blocks are grouped into 4 groups of 6 blocks each:
+\begin{equation}
+\eta_g = \eta_{\text{base}} \cdot r^{G - g}, \quad g = 1, 2, \ldots, G = 4
+\label{eq:layerwise_lr}
+\end{equation}
+
+\noindent yielding the following learning rates:
+\begin{center}
+\small
+\begin{tabular}{lcc}
+\toprule
+\textbf{Parameter Group} & \textbf{Blocks} & \textbf{Learning Rate} \\
+\midrule
+Embedding layer & --- & $\eta_{\text{base}} \cdot r^{24} \approx 1.07 \times 10^{-7}$ \\
+Deep blocks & 0--5 & $\eta_{\text{base}} \cdot r^3 \approx 3.07 \times 10^{-6}$ \\
+Mid-deep blocks & 6--11 & $\eta_{\text{base}} \cdot r^2 \approx 3.61 \times 10^{-6}$ \\
+Mid-shallow blocks & 12--17 & $\eta_{\text{base}} \cdot r^1 = 4.25 \times 10^{-6}$ \\
+Shallow blocks & 18--23 & $\eta_{\text{base}} \cdot r^0 = 5.00 \times 10^{-6}$ \\
+Classification head & --- & $10 \cdot \eta_{\text{base}} = 5.00 \times 10^{-5}$ \\
+Normalization layers & all & $\eta_{\text{base}}$, $\lambda = 0$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Learning Rate Schedule}: CosineAnnealingWarmRestarts with $T_0 = 10$, $T_{\text{mult}} = 2$, and $\eta_{\min} = 10^{-7}$:
+\begin{equation}
+\eta^{(t)} = \eta_{\min} + \frac{1}{2}(\eta_{g} - \eta_{\min})\left(1 + \cos\!\left(\frac{T_{\text{cur}}}{T_i}\pi\right)\right)
+\end{equation}
+where $T_i$ is the period of the $i$-th restart cycle.
+
+\subsubsection{Loss Function.}
+Training uses Focal Loss~\cite{focal_loss} with label smoothing to address class imbalance in the PA-100K dataset:
+\begin{equation}
+\mathcal{L}_{\text{focal}}(\hat{\mathbf{y}}, y) = -\alpha_y\,(1 - p_y)^\gamma \log(p_y)
+\label{eq:focal}
+\end{equation}
+
+First, label smoothing is applied to the target distribution:
+\begin{equation}
+\tilde{y}_c = (1 - \epsilon)\,\mathbbm{1}[c = y] + \frac{\epsilon}{C}
+\end{equation}
+where $\epsilon = 0.05$ is the smoothing parameter and $C = 2$ is the number of classes. The cross-entropy is then computed as:
+\begin{equation}
+\text{CE}(\hat{\mathbf{y}}, \tilde{\mathbf{y}}) = -\sum_{c=1}^{C} \tilde{y}_c \log(\softmax(\hat{\mathbf{y}})_c)
+\end{equation}
+and the focal weight $(1 - p_y)^\gamma$ with $\gamma = 2.0$ down-weights well-classified examples, focusing the loss on hard examples. The class weight $\alpha_y$ is computed as the inverse class frequency to balance the dataset.
+
+\subsubsection{Exponential Moving Average (EMA).}
+An EMA copy of model weights accelerates convergence and improves generalization:
+\begin{equation}
+\boldsymbol{\theta}_{\text{ema}}^{(t)} = \mu \cdot \boldsymbol{\theta}_{\text{ema}}^{(t-1)} + (1 - \mu) \cdot \boldsymbol{\theta}^{(t)}, \quad \mu = 0.999
+\label{eq:ema}
+\end{equation}
+The EMA model is used for validation, model selection (best checkpoint), and final inference.
+
+\subsubsection{Additional Training Details.}
+Gradient clipping with $\|\mathbf{g}\|_{\max} = 1.0$ is applied to stabilize training. Mixed-precision training (FP16 with gradient scaling) is used throughout. Data augmentation includes random horizontal flip, color jitter (brightness/contrast/saturation $\pm 0.15$), random erasing ($p = 0.15$, scale $= [0.02, 0.1]$), and random rotation ($\pm 15^\circ$).
+
+
+\begin{algorithm}[H]
+\caption{EVA-02 Gender Classifier: Two-Phase Training}\label{alg:gender_train}
+\begin{algorithmic}[1]
+\Require PA-100K training set $\mathcal{D}_{\text{train}}$, validation set $\mathcal{D}_{\text{val}}$
+\Ensure Trained model weights $\boldsymbol{\theta}^*$
+
+\State Initialize EVA-02 Large backbone with MIM pretrained weights
+\State Attach custom head: $\layernorm(1024) \to \text{Dropout}(0.5) \to \text{Linear}(1024, 2)$
+\State $\boldsymbol{\theta}_{\text{ema}} \gets \boldsymbol{\theta}$ \hfill $\triangleright$ Initialize EMA
+
+\Statex
+\Statex \textbf{--- Phase 1: Head-Only Training ($E_1 = 15$ epochs) ---}
+\State Freeze backbone parameters; train only head
+\State $\textsc{Opt} \gets \textsc{AdamW}(\boldsymbol{\theta}_{\text{head}};\; \eta=10^{-3},\; \lambda=0.05)$
+\State $\textsc{Sched} \gets \textsc{OneCycleLR}(\eta_{\max}=3 \times 10^{-3},\; \text{warmup}=10\%)$
+
+\For{epoch $= 1$ to $15$}
+    \For{each mini-batch $(\mathbf{X}, \mathbf{y}) \in \mathcal{D}_{\text{train}}$}
+        \State $\hat{\mathbf{y}} \gets \textsc{EVA02}(\mathbf{X})$ with AMP (FP16)
+        \State $\mathcal{L} \gets \mathcal{L}_{\text{focal}}(\hat{\mathbf{y}}, \mathbf{y};\; \gamma=2.0,\; \epsilon=0.05)$
+        \State Backprop; clip $\|\mathbf{g}\| \leq 1.0$; optimizer step
+        \State $\boldsymbol{\theta}_{\text{ema}} \gets 0.999 \cdot \boldsymbol{\theta}_{\text{ema}} + 0.001 \cdot \boldsymbol{\theta}$
+    \EndFor
+    \State Validate using $\boldsymbol{\theta}_{\text{ema}}$; save best checkpoint
+\EndFor
+
+\Statex
+\Statex \textbf{--- Phase 2: Full Fine-Tuning ($E_2 = 12$ epochs) ---}
+\State Unfreeze all parameters
+\State Assign layer-wise LR: $\eta_g = 5\!\times\!10^{-6} \cdot 0.85^{G-g}$; head LR $= 5\!\times\!10^{-5}$
+\State $\textsc{Sched} \gets \textsc{CosineAnnealingWarmRestarts}(T_0=10,\; T_{\text{mult}}=2,\; \eta_{\min}=10^{-7})$
+
+\For{epoch $= 1$ to $12$}
+    \For{each mini-batch $(\mathbf{X}, \mathbf{y}) \in \mathcal{D}_{\text{train}}$}
+        \State $\hat{\mathbf{y}} \gets \textsc{EVA02}(\mathbf{X})$ with AMP
+        \State $\mathcal{L} \gets \mathcal{L}_{\text{focal}}(\hat{\mathbf{y}}, \mathbf{y};\; \gamma=2.0,\; \epsilon=0.05)$
+        \State Backprop; clip $\|\mathbf{g}\| \leq 1.0$; optimizer step with per-group LR
+        \State $\boldsymbol{\theta}_{\text{ema}} \gets 0.999 \cdot \boldsymbol{\theta}_{\text{ema}} + 0.001 \cdot \boldsymbol{\theta}$
+    \EndFor
+    \State Validate using $\boldsymbol{\theta}_{\text{ema}}$; save best checkpoint
+\EndFor
+
+\State $\boldsymbol{\theta}^* \gets \boldsymbol{\theta}_{\text{ema}}$ at best validation accuracy
+\State \Return $\boldsymbol{\theta}^*$
+\end{algorithmic}
+\end{algorithm}
+
+
+% ──────────────────────────────────────────────────────────────────────
+\subsection{Dual SlowFast Violence Detection}
+\label{subsec:violence}
+% ──────────────────────────────────────────────────────────────────────
+
+Violence detection employs a \textbf{dual-stream SlowFast} architecture~\cite{slowfast} that processes both RGB appearance and optical flow motion cues through separate SlowFast-R50 backbones, fused via late concatenation.
+
+\subsubsection{SlowFast Network.}
+Each SlowFast-R50 network contains two parallel pathways operating at different temporal resolutions:
+\begin{itemize}[nosep]
+    \item \textbf{Slow pathway}: Operates at low temporal rate ($T_{\text{slow}} = 8$ frames), capturing detailed spatial-semantic features. Based on a 3D ResNet-50 with temporal stride.
+    \item \textbf{Fast pathway}: Operates at high temporal rate ($T_{\text{fast}} = 32$ frames), capturing rapid motion dynamics with a lightweight channel structure ($\beta = 1/8$ channel ratio).
+\end{itemize}
+
+Lateral connections fuse information from the Fast pathway to the Slow pathway at multiple stages. The final feature representation of each stream is formed by concatenating the Slow and Fast pathway outputs after global average pooling:
+\begin{align}
+\mathbf{f}_{\text{slow}} &= \text{GAP}(\text{SlowPath}(\mathbf{V})) \in \R^{2048} \\
+\mathbf{f}_{\text{fast}} &= \text{GAP}(\text{FastPath}(\mathbf{V})) \in \R^{256} \\
+\mathbf{f}_{\text{stream}} &= [\mathbf{f}_{\text{slow}};\; \mathbf{f}_{\text{fast}}] \in \R^{2304}
+\end{align}
+
+\subsubsection{Dual-Stream Architecture.}
+The proposed system uses two separate SlowFast-R50 networks:
+\begin{itemize}[nosep]
+    \item \textbf{RGB stream}: A standard SlowFast-R50 processing RGB frames (3 channels).
+    \item \textbf{Optical flow stream}: A modified SlowFast-R50 whose input stem convolutions are adapted from 3 to 2 input channels to accept dense optical flow.
+\end{itemize}
+
+The flow stream stem modification replaces the first convolutional layer in each pathway:
+\begin{equation}
+\textsc{Conv3D}(3, C_{\text{out}}, k, s, p) \;\longrightarrow\; \textsc{Conv3D}(2, C_{\text{out}}, k, s, p)
+\end{equation}
+Weights for the 2 input channels are initialized from the first 2 channels of the pretrained RGB convolution, preserving learned spatial filters.
+
+\subsubsection{Late Fusion Classifier.}
+Features from both streams are concatenated and classified through a linear fusion head:
+\begin{equation}
+\hat{\mathbf{y}}_v = \mathbf{W}_f \cdot \text{Dropout}_{0.5}\bigl([\mathbf{f}_{\text{rgb}};\; \mathbf{f}_{\text{flow}}]\bigr) + \mathbf{b}_f \in \R^2
+\label{eq:fusion}
+\end{equation}
+where $\mathbf{W}_f \in \R^{2 \times 4608}$ and the total feature dimension is $2304 \times 2 = 4608$. Violence probability is:
+\begin{equation}
+P(\text{Fight}) = \softmax(\hat{\mathbf{y}}_v)_0
+\end{equation}
+
+\subsubsection{Optical Flow Computation.}
+Dense optical flow is computed using the Farneback algorithm~\cite{farneback} between consecutive frames:
+\begin{equation}
+\mathbf{F}^{(t)} = \textsc{Farneback}\bigl(I_{\text{gray}}^{(t-1)}, I_{\text{gray}}^{(t)}\bigr) \in \R^{H \times W \times 2}
+\end{equation}
+with parameters: pyramid scale $= 0.5$, levels $= 3$, window size $= 15$, iterations $= 3$, polynomial neighborhood $= 5$, and Gaussian smoothing $\sigma = 1.2$. The flow field is normalized to $[0, 1]$:
+\begin{equation}
+\tilde{F}_c^{(t)} = \frac{F_c^{(t)}}{\|\mathbf{F}^{(t)}\|_{\max}} \cdot 0.5 + 0.5, \quad c \in \{x, y\}
+\end{equation}
+
+\subsubsection{Frame Sampling.}
+From a rolling buffer of $B = 64$ raw frames, temporal indices for each pathway are uniformly sampled:
+\begin{equation}
+\text{idx}_k = \left\lfloor\frac{(B-1) \cdot k}{T_{\text{path}} - 1}\right\rfloor, \quad k = 0, 1, \ldots, T_{\text{path}} - 1
+\end{equation}
+where $T_{\text{path}} \in \{8, 32\}$ for the slow and fast pathways, respectively. All frames are resized to $224 \times 224$.
+
+\subsubsection{Temporal Smoothing.}
+Raw violence predictions are temporally smoothed over a sliding window of the last 5 predictions. Violence is declared when at least 2 of the last 5 predictions are ``Fight'' with confidence $> 0.6$:
+\begin{equation}
+\text{Smoothed}^{(t)} = \begin{cases}
+\textit{Fight} & \text{if } \displaystyle\sum_{k=t-4}^{t} \mathbbm{1}\bigl[c_k = \textit{Fight} \;\wedge\; p_k > 0.6\bigr] \geq 2 \\[6pt]
+\textit{NonFight} & \text{otherwise}
+\end{cases}
+\label{eq:temporal_smooth}
+\end{equation}
+
+
+\begin{algorithm}[H]
+\caption{Dual SlowFast: Violence Detection Forward Pass}\label{alg:violence_forward}
+\begin{algorithmic}[1]
+\Require Frame buffer $\mathcal{F} = \{(I_k^{\text{rgb}}, I_k^{\text{gray}})\}_{k=1}^B$, $B = 64$
+\Ensure Violence class $c_v$, confidence $p_v$
+
+\State $\textsc{idx}_{\text{slow}} \gets \textsc{Linspace}(0, B-1, 8)$; \quad $\textsc{idx}_{\text{fast}} \gets \textsc{Linspace}(0, B-1, 32)$
+
+\Statex \textbf{--- RGB Stream ---}
+\For{$k \in \textsc{idx}_{\text{slow}} \cup \textsc{idx}_{\text{fast}}$}
+    \State $\mathbf{r}_k \gets \textsc{Resize}(I_k^{\text{rgb}}, 224 \times 224) / 255$
+    \State $\mathbf{r}_k \gets (\mathbf{r}_k - \boldsymbol{\mu}_{\text{rgb}}) / \boldsymbol{\sigma}_{\text{rgb}}$ \hfill $\triangleright$ $\boldsymbol{\mu} = (0.45, 0.45, 0.45)$
+\EndFor
+\State $\mathbf{V}_{\text{slow}}^{\text{rgb}} \gets \textsc{Stack}(\{\mathbf{r}_k \mid k \in \textsc{idx}_{\text{slow}}\}) \in \R^{3 \times 8 \times 224 \times 224}$
+\State $\mathbf{V}_{\text{fast}}^{\text{rgb}} \gets \textsc{Stack}(\{\mathbf{r}_k \mid k \in \textsc{idx}_{\text{fast}}\}) \in \R^{3 \times 32 \times 224 \times 224}$
+\State $\mathbf{f}_{\text{rgb}} \gets \textsc{SlowFast-R50}_{\text{rgb}}([\mathbf{V}_{\text{slow}}^{\text{rgb}}, \mathbf{V}_{\text{fast}}^{\text{rgb}}]) \in \R^{2304}$
+
+\Statex \textbf{--- Optical Flow Stream ---}
+\For{$k \in \textsc{idx}_{\text{slow}} \cup \textsc{idx}_{\text{fast}}$}
+    \State $\mathbf{F}_k \gets \textsc{Farneback}(I_{k-1}^{\text{gray}}, I_k^{\text{gray}}) \in \R^{224 \times 224 \times 2}$
+    \State $\tilde{\mathbf{F}}_k \gets \textsc{Normalize}(\mathbf{F}_k)$ \hfill $\triangleright$ Scale to $[0, 1]$
+    \State $\tilde{\mathbf{F}}_k \gets (\tilde{\mathbf{F}}_k - \boldsymbol{\mu}_{\text{flow}}) / \boldsymbol{\sigma}_{\text{flow}}$ \hfill $\triangleright$ $\boldsymbol{\mu} = (0.5, 0.5)$
+\EndFor
+\State Build $\mathbf{V}_{\text{slow}}^{\text{flow}} \in \R^{2 \times 8 \times 224 \times 224}$, $\mathbf{V}_{\text{fast}}^{\text{flow}} \in \R^{2 \times 32 \times 224 \times 224}$
+\State $\mathbf{f}_{\text{flow}} \gets \textsc{SlowFast-R50}_{\text{flow}}([\mathbf{V}_{\text{slow}}^{\text{flow}}, \mathbf{V}_{\text{fast}}^{\text{flow}}]) \in \R^{2304}$
+
+\Statex \textbf{--- Fusion ---}
+\State $\hat{\mathbf{y}}_v \gets \mathbf{W}_f \cdot \text{Dropout}_{0.5}([\mathbf{f}_{\text{rgb}};\; \mathbf{f}_{\text{flow}}]) + \mathbf{b}_f \in \R^2$
+\State $c_v \gets \arg\max(\softmax(\hat{\mathbf{y}}_v))$; \quad $p_v \gets \max(\softmax(\hat{\mathbf{y}}_v))$
+\State Apply temporal smoothing (Eq.~\eqref{eq:temporal_smooth})
+
+\State \Return $(c_v, p_v)$
+\end{algorithmic}
+\end{algorithm}
+
+
+% ──────────────────────────────────────────────────────────────────────
+\subsection{Training Procedure for Violence Detector}
+\label{subsec:violence_training}
+% ──────────────────────────────────────────────────────────────────────
+
+The dual SlowFast model is trained on the RWF-2000 dataset~\cite{rwf2000}, which contains 2,000 surveillance video clips (5 seconds each at 30 FPS), equally split into Fight and NonFight categories, with a 1,600/400 train/validation split. Preprocessed $\texttt{.npy}$ files contain 16 frames per clip, each of shape $224 \times 224$ with 5 channels (3 RGB + 2 optical flow).
+
+\textbf{Optimizer}: AdamW with $\eta = 10^{-4}$, weight decay $\lambda = 10^{-4}$, and \texttt{fused=True} for CUDA kernel fusion.
+
+\textbf{Learning Rate Schedule}: CosineAnnealingLR with $T_{\max} = 50$:
+\begin{equation}
+\eta^{(t)} = \eta_{\min} + \frac{1}{2}(\eta_0 - \eta_{\min})\left(1 + \cos\!\left(\frac{t}{T_{\max}}\pi\right)\right)
+\end{equation}
+
+\textbf{Loss Function}: Weighted CrossEntropyLoss with label smoothing $\epsilon = 0.1$:
+\begin{equation}
+\mathcal{L}_{\text{CE}}(\hat{\mathbf{y}}, y) = -\sum_{c=0}^{1} w_c \cdot \tilde{y}_c \cdot \log(\softmax(\hat{\mathbf{y}})_c)
+\label{eq:ce_loss}
+\end{equation}
+where $w_c = \frac{N}{2 \cdot N_c}$ for class-balanced weighting and $\tilde{y}_c$ includes label smoothing.
+
+\textbf{Training Configuration}: Batch size $= 24$, 50 epochs with early stopping (patience $= 10$), BF16 mixed precision (no gradient scaler needed due to BF16's full dynamic range), TF32 for matmul operations, and \texttt{torch.compile()} for CUDA kernel fusion.
+
+\textbf{Data Augmentation}: Synchronized random horizontal flip with flow $x$-component negation ($p = 0.5$), plus RGB-specific color jitter (brightness/contrast/saturation $\pm 0.2$, hue $\pm 0.1$) and Gaussian blur.
+
+
+\begin{algorithm}[H]
+\caption{Dual SlowFast: Violence Detection Training}\label{alg:violence_train}
+\begin{algorithmic}[1]
+\Require RWF-2000 training set $\mathcal{D}_{\text{train}}$, validation set $\mathcal{D}_{\text{val}}$
+\Ensure Trained models $(\boldsymbol{\theta}_{\text{rgb}}^*, \boldsymbol{\theta}_{\text{flow}}^*, \boldsymbol{\theta}_{\text{fusion}}^*)$
+
+\State $\textsc{RGB} \gets \textsc{SlowFast-R50}(\text{pretrained, proj} \to \text{Identity})$  \hfill $\triangleright$ Remove proj head
+\State $\textsc{Flow} \gets \textsc{SlowFast-R50}(\text{pretrained, stems}: 3\!\to\!2\text{ch, proj} \to \text{Identity})$
+\State $\textsc{Fusion} \gets \text{Dropout}(0.5) \to \text{Linear}(4608, 2)$
+\State $\textsc{Opt} \gets \textsc{AdamW}(\boldsymbol{\theta}_{\text{all}};\; \eta=10^{-4},\; \lambda=10^{-4},\; \texttt{fused})$
+\State $\textsc{Sched} \gets \textsc{CosineAnnealingLR}(T_{\max}=50)$
+\State best\_acc $\gets 0$; patience\_ctr $\gets 0$
+
+\For{epoch $= 1$ to $50$}
+    \For{each batch $(\mathbf{X}_{\text{rgb}}, \mathbf{X}_{\text{flow}}, \mathbf{y}) \in \mathcal{D}_{\text{train}}$}
+        \State Build slow/fast clips for both streams \hfill $\triangleright$ 8 and 32 frames
+        \State \textbf{with} BF16 autocast:
+        \State \quad $\mathbf{f}_{\text{rgb}} \gets \textsc{RGB}([\mathbf{V}_{\text{slow}}^{\text{rgb}}, \mathbf{V}_{\text{fast}}^{\text{rgb}}])$
+        \State \quad $\mathbf{f}_{\text{flow}} \gets \textsc{Flow}([\mathbf{V}_{\text{slow}}^{\text{flow}}, \mathbf{V}_{\text{fast}}^{\text{flow}}])$
+        \State \quad $\hat{\mathbf{y}} \gets \textsc{Fusion}(\mathbf{f}_{\text{rgb}}, \mathbf{f}_{\text{flow}})$
+        \State \quad $\mathcal{L} \gets \mathcal{L}_{\text{CE}}(\hat{\mathbf{y}}, \mathbf{y};\; \text{weights},\; \epsilon=0.1)$
+        \State Backprop; optimizer step
+    \EndFor
+
+    \State Validate on $\mathcal{D}_{\text{val}}$
+    \If{val\_acc $>$ best\_acc}
+        \State best\_acc $\gets$ val\_acc; save checkpoint; patience\_ctr $\gets 0$
+    \Else
+        \State patience\_ctr $\gets$ patience\_ctr $+ 1$
+        \If{patience\_ctr $\geq 10$} \textbf{break} \hfill $\triangleright$ Early stopping
+        \EndIf
+    \EndIf
+    \State $\textsc{Sched.step()}$
+\EndFor
+
+\State \Return best checkpoint $(\boldsymbol{\theta}_{\text{rgb}}^*, \boldsymbol{\theta}_{\text{flow}}^*, \boldsymbol{\theta}_{\text{fusion}}^*)$
+\end{algorithmic}
+\end{algorithm}
+
+
+% ──────────────────────────────────────────────────────────────────────
+\subsection{Grad-CAM: Spatial Evidence Localization}
+\label{subsec:gradcam}
+% ──────────────────────────────────────────────────────────────────────
+
+When violence is detected, Gradient-weighted Class Activation Mapping (Grad-CAM)~\cite{gradcam} is applied to the RGB SlowFast stream to generate a spatial heatmap indicating \emph{where} in the frame the model's ``Fight'' decision originates. This serves two purposes: (i)~providing visual evidence for operator verification, and (ii)~localizing violence to specific spatial regions for intersection with person bounding boxes.
+
+\subsubsection{Grad-CAM Formulation.}
+Forward and backward hooks are registered on the last residual stage of the slow pathway (\texttt{blocks[5]}), which produces activation maps $\mathbf{A}^{(l)} \in \R^{C \times T' \times H' \times W'}$, where $C$, $T'$, $H'$, $W'$ are the channel, temporal, height, and width dimensions of the feature map.
+
+Given the fight class score $y^c$ (before softmax), the gradient of $y^c$ with respect to the feature map activations is:
+\begin{equation}
+\frac{\partial y^c}{\partial \mathbf{A}^{(l)}} \in \R^{C \times T' \times H' \times W'}
+\end{equation}
+
+Channel importance weights are computed by global average pooling the gradients over the spatio-temporal dimensions:
+\begin{equation}
+w_k^c = \frac{1}{T' \cdot H' \cdot W'} \sum_{t} \sum_{i} \sum_{j} \frac{\partial y^c}{\partial A_{k,t,i,j}^{(l)}}, \quad k = 1, \ldots, C
+\label{eq:gradcam_weights}
+\end{equation}
+
+The Grad-CAM map is then the ReLU-activated weighted sum of activations, averaged over the temporal dimension:
+\begin{equation}
+\mathcal{M}_{\text{CAM}}(i, j) = \relu\!\left(\frac{1}{T'}\sum_{t=1}^{T'}\sum_{k=1}^{C} w_k^c \cdot A_{k,t,i,j}^{(l)}\right) \in \R^{H' \times W'}
+\label{eq:gradcam_map}
+\end{equation}
+
+The map is normalized to $[0, 1]$ and upsampled to the original frame resolution via bilinear interpolation:
+\begin{equation}
+\hat{\mathcal{M}}(i,j) = \frac{\mathcal{M}(i,j) - \min(\mathcal{M})}{\max(\mathcal{M}) - \min(\mathcal{M}) + \epsilon}
+\end{equation}
+
+
+\subsubsection{Evidence Bounding Box Extraction.}
+The normalized heatmap $\hat{\mathcal{M}}$ is thresholded to extract violent regions:
+\begin{equation}
+\text{Mask}(i,j) = \mathbbm{1}\!\left[\hat{\mathcal{M}}(i,j) \geq \tau_{\text{cam}} \cdot \max(\hat{\mathcal{M}})\right]
+\end{equation}
+where $\tau_{\text{cam}} = 0.5$. Connected components are extracted via contour detection (OpenCV), and bounding boxes are retained only if their contour area exceeds $A_{\min} = 1600$ pixels (equivalent to a $40 \times 40$ pixel region). The resulting bounding boxes $\mathcal{B}_t = \{(x, y, w, h)\}$ localize the spatial regions driving the violence prediction.
+
+
+\subsubsection{Heatmap Overlay.}
+For visualization, the heatmap is rendered as a JET-colorized overlay blended with the original frame:
+\begin{equation}
+\hat{I}_{\text{overlay}} = (1 - \alpha) \cdot I_t + \alpha \cdot \textsc{JET}(\hat{\mathcal{M}}), \quad \alpha = 0.45
+\end{equation}
+
+
+\begin{algorithm}[H]
+\caption{Grad-CAM: Spatial Evidence Localization}\label{alg:gradcam}
+\begin{algorithmic}[1]
+\Require RGB slow/fast tensors $\mathbf{V}_{\text{slow}}, \mathbf{V}_{\text{fast}}$, target class $c = \textit{Fight}$
+\Ensure Heatmap $\hat{\mathcal{M}} \in [0,1]^{H \times W}$, evidence bboxes $\mathcal{B}$
+
+\State Register forward hook on \texttt{blocks[5]} $\to$ store activations $\mathbf{A}$
+\State Register backward hook on \texttt{blocks[5]} $\to$ store gradients $\nabla\mathbf{A}$
+
+\State $\mathbf{V}_{\text{slow}} \gets \mathbf{V}_{\text{slow}}.\texttt{requires\_grad\_(True)}$
+\State $\mathbf{f} \gets \textsc{SlowFast-R50}_{\text{rgb}}([\mathbf{V}_{\text{slow}}, \mathbf{V}_{\text{fast}}])$ \hfill $\triangleright$ Forward with grad enabled
+\State $y^c \gets \mathbf{f}[:,\, 0]$ \hfill $\triangleright$ Fight class score
+\State $y^c.\texttt{backward()}$ \hfill $\triangleright$ Compute gradients
+
+\State $\mathbf{w} \gets \text{GAP}_{T',H',W'}(\nabla\mathbf{A}) \in \R^{C}$ \hfill $\triangleright$ Channel weights (Eq.~\eqref{eq:gradcam_weights})
+\State $\mathcal{M} \gets \relu\!\bigl(\text{mean}_T(\mathbf{w} \cdot \mathbf{A})\bigr) \in \R^{H' \times W'}$ \hfill $\triangleright$ Grad-CAM map (Eq.~\eqref{eq:gradcam_map})
+\State $\hat{\mathcal{M}} \gets \textsc{Normalize}(\mathcal{M})$; resize to $(H, W)$ \hfill $\triangleright$ Bilinear interpolation
+
+\State $\text{Mask} \gets \hat{\mathcal{M}} \geq 0.5 \cdot \max(\hat{\mathcal{M}})$
+\State $\mathcal{B} \gets \textsc{FindContours}(\text{Mask})$; filter by area $\geq 1600$ px
+
+\State \Return $\hat{\mathcal{M}},\; \mathcal{B}$
+\end{algorithmic}
+\end{algorithm}
+
+
+% ──────────────────────────────────────────────────────────────────────
+\subsection{Alert System and Operator Verification}
+\label{subsec:alert}
+% ──────────────────────────────────────────────────────────────────────
+
+The alert system generates two types of safety alerts and captures evidence packages for operator review.
+
+\subsubsection{Lone Woman at Night Alert.}
+A nighttime lone-woman alert is triggered when exactly one female-classified person and zero male-classified persons are detected during nighttime hours ($22\!:\!00$--$06\!:\!00$):
+\begin{equation}
+\ell_{\text{lone}}^{(t)} = \mathbbm{1}\!\left[|\mathcal{F}_t| = 1 \;\wedge\; |\mathcal{M}_t| = 0 \;\wedge\; h_t \in [22, 6) \;\wedge\; \Delta t > T_{\text{cool}}^{\text{lone}}\right]
+\label{eq:lone_alert}
+\end{equation}
+where $\mathcal{F}_t = \{i \mid \bar{g}_i < 0.5\}$ is the set of female tracks, $\mathcal{M}_t = \{i \mid \bar{g}_i \geq 0.5\}$ is the set of male tracks, $h_t$ is the current hour, and $T_{\text{cool}}^{\text{lone}} = 30$ seconds is the cooldown period.
+
+\subsubsection{Violence Against Women Alert.}
+A violence alert is triggered when a female-classified track overlaps with a Grad-CAM evidence bounding box, and the violence count for that track exceeds a persistence threshold:
+\begin{equation}
+\ell_{\text{viol}}^{(t)} = \mathbbm{1}\!\left[\exists\, i \in \mathcal{F}_t : \text{IoU}(\mathbf{b}_i, \mathcal{B}_t) > 0 \;\wedge\; n_i^{\text{viol}} \geq N_{\text{thresh}} \;\wedge\; \Delta t > T_{\text{cool}}^{\text{viol}}\right]
+\label{eq:viol_alert}
+\end{equation}
+where $n_i^{\text{viol}}$ is the cumulative violence detection count for track $i$ (incremented at most once per second), $N_{\text{thresh}} = 5$ is the persistence threshold, and $T_{\text{cool}}^{\text{viol}} = 10$ seconds is the cooldown.
+
+\subsubsection{Operator Verification and Evidence Capture.}
+When violence confidence exceeds $\tau_{\text{evidence}} = 0.70$ and at least $T_{\text{cool}}^{\text{evidence}} = 15$ seconds have elapsed since the last capture, the system generates an evidence package consisting of:
+\begin{enumerate}[nosep]
+    \item A raw snapshot of the current frame ($I_t$).
+    \item A Grad-CAM heatmap overlay frame ($\hat{I}_{\text{overlay}}$) with evidence bounding boxes.
+    \item A video clip of the last $T_{\text{clip}} = 5$ seconds of raw frames (written asynchronously via a background thread).
+    \item Structured JSON metadata: timestamp, violence confidence, demographic counts, number of women intersecting evidence regions, and bounding box coordinates.
+\end{enumerate}
+
+Evidence records are stored in a structured directory layout and maintained in a review queue. An operator can subsequently mark each incident as \textit{verified} (true positive) or \textit{dismissed} (false positive), enabling post-deployment accuracy auditing.
+
+
+% ──────────────────────────────────────────────────────────────────────
+\subsection{Implementation Details}
+\label{subsec:implementation}
+% ──────────────────────────────────────────────────────────────────────
+
+Table~\ref{tab:hyperparams} summarizes the key hyperparameters and design choices across all system components.
+
+\begin{table}[H]
+\centering
+\caption{System-wide hyperparameters and configuration.}
+\label{tab:hyperparams}
+\small
+\begin{tabular}{@{}llc@{}}
+\toprule
+\textbf{Module} & \textbf{Parameter} & \textbf{Value} \\
+\midrule
+\multirow{4}{*}{Person Detection} & Model & YOLOv5s \\
+& Confidence threshold & 0.40 \\
+& Max detections per frame & 10 \\
+& IoU tracking threshold & 0.50 \\
+\midrule
+\multirow{2}{*}{Pose Estimation} & Model & MediaPipe Pose (complexity 0) \\
+& Min confidence & 0.3 \\
+\midrule
+\multirow{7}{*}{Gender Classifier} & Backbone & EVA-02 Large ViT-L/14 \\
+& Input resolution & $448 \times 448$ \\
+& Backbone params & 304M \\
+& Drop path rate & 0.4 \\
+& Head dropout & 0.5 \\
+& Upper crop ratio (face model) & 40\% \\
+& Gender history length & 5 \\
+\midrule
+\multirow{6}{*}{\parbox{3cm}{Gender Training\\(Phase 1 / Phase 2)}} & Epochs & 15 / 12 \\
+& Learning rate & $10^{-3}$ / $5\!\times\!10^{-6}$ \\
+& LR schedule & OneCycleLR / CosineWarmRestarts \\
+& Layer decay rate ($r$) & --- / 0.85 \\
+& Loss & Focal ($\gamma\!=\!2.0$, $\epsilon\!=\!0.05$) \\
+& EMA decay & 0.999 \\
+\midrule
+\multirow{7}{*}{Violence Detector} & Architecture & Dual SlowFast-R50 \\
+& Slow / Fast frames & 8 / 32 \\
+& Input resolution & $224 \times 224$ \\
+& Feature dim per stream & 2304 \\
+& Fusion dim & 4608 \\
+& Frame buffer size & 64 \\
+& Temporal smoothing window & 5 \\
+\midrule
+\multirow{5}{*}{\parbox{3cm}{Violence Training}} & Epochs (max) & 50 \\
+& Learning rate & $10^{-4}$ \\
+& LR schedule & CosineAnnealingLR ($T_{\max}\!=\!50$) \\
+& Batch size & 24 \\
+& Loss & CE (weighted, $\epsilon\!=\!0.1$) \\
+\midrule
+\multirow{3}{*}{Grad-CAM} & Target layer & \texttt{blocks[5]} (slow pathway) \\
+& Heatmap threshold & 0.50 \\
+& Min contour area & 1600 px \\
+\midrule
+\multirow{4}{*}{Alert System} & Night hours & 22:00--06:00 \\
+& Violence count threshold & 5 \\
+& Lone-woman cooldown & 30~sec \\
+& Violence alert cooldown & 10~sec \\
+\midrule
+\multirow{3}{*}{Evidence Capture} & Confidence threshold & 0.70 \\
+& Cooldown & 15~sec \\
+& Clip duration & 5~sec \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The system is implemented in Python using PyTorch for deep learning inference, OpenCV for video I/O and optical flow computation, the \texttt{timm} library~\cite{timm} for EVA-02 model loading, PyTorchVideo~\cite{pytorchvideo} for SlowFast networks, Ultralytics~\cite{yolov5} for YOLO detection, and Google's MediaPipe~\cite{mediapipe} for pose estimation. CUDA acceleration with TF32 precision for matrix multiplication and BF16 mixed-precision inference is employed to achieve real-time throughput on modern GPUs.
+
+
+% ══════════════════════════════════════════════════════════════════════
+% References
+% ══════════════════════════════════════════════════════════════════════
+\begin{thebibliography}{99}
+
+\bibitem{yolov5} G.~Jocher, ``YOLOv5 by Ultralytics,'' 2020. [Online]. Available: \url{https://github.com/ultralytics/yolov5}
+
+\bibitem{mediapipe} C.~Lugaresi et al., ``MediaPipe: A framework for building perception pipelines,'' \emph{arXiv preprint arXiv:1906.08172}, 2019.
+
+\bibitem{eva02} Y.~Fang et al., ``EVA-02: A visual representation for neon genesis,'' \emph{arXiv preprint arXiv:2303.11331}, 2023.
+
+\bibitem{pa100k} Y.~Liu et al., ``HydraPlus-Net: Attentive deep features for pedestrian analysis,'' in \emph{Proc.\ ICCV}, 2017, pp.~350--359.
+
+\bibitem{focal_loss} T.-Y.~Lin, P.~Goyal, R.~Girshick, K.~He, and P.~Doll{\'a}r, ``Focal loss for dense object detection,'' in \emph{Proc.\ ICCV}, 2017, pp.~2980--2988.
+
+\bibitem{adamw} I.~Loshchilov and F.~Hutter, ``Decoupled weight decay regularization,'' in \emph{Proc.\ ICLR}, 2019.
+
+\bibitem{onecycle} L.~N.~Smith and N.~Topin, ``Super-convergence: Very fast training of neural networks using large learning rates,'' in \emph{Proc.\ SPIE Defense + Commercial Sensing}, 2019.
+
+\bibitem{slowfast} C.~Feichtenhofer, H.~Fan, J.~Malik, and K.~He, ``SlowFast networks for video recognition,'' in \emph{Proc.\ ICCV}, 2019, pp.~6202--6211.
+
+\bibitem{farneback} G.~Farneb{\"a}ck, ``Two-frame motion estimation based on polynomial expansion,'' in \emph{Proc.\ SCIA}, 2003, pp.~363--370.
+
+\bibitem{rwf2000} M.~Cheng, K.~Cai, and M.~Li, ``RWF-2000: An open large scale video database for violence detection,'' in \emph{Proc.\ ICPR}, 2021, pp.~4183--4190.
+
+\bibitem{gradcam} R.~R.~Selvaraju, M.~Cogswell, A.~Das, R.~Vedantam, D.~Parikh, and D.~Batra, ``Grad-CAM: Visual explanations from deep networks via gradient-based localization,'' in \emph{Proc.\ ICCV}, 2017, pp.~618--626.
+
+\bibitem{timm} R.~Wightman, ``PyTorch image models,'' 2019. [Online]. Available: \url{https://github.com/huggingface/pytorch-image-models}
+
+\bibitem{pytorchvideo} H.~Fan et al., ``PyTorchVideo: A deep learning library for video understanding,'' in \emph{Proc.\ ACM MM}, 2021, pp.~3783--3786.
+
+\end{thebibliography}
+
+\end{document}
