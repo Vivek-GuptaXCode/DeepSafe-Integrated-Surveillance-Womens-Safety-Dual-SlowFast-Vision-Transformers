@@ -167,4 +167,6 @@ If you use this project in academic work, cite the repository and the underlying
 
 ## License
 
-No explicit license file is currently present in this repository. Add a `LICENSE` file before reuse/distribution under a specific license.
+This project is licensed under the Apache License, Version 2.0.
+
+See `LICENSE` for the full license notice and terms.
