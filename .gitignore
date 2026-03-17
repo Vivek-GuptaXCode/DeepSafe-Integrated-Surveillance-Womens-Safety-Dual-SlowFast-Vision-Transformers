@@ -31,3 +31,6 @@ Thumbs.db
 *.log
 output_annotated.mp4
 gradcam_overlay.jpg
+
+# Project-specific exclusions
+docs/
